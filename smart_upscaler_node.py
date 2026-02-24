@@ -257,35 +257,33 @@ def load_model(model_name: str, device: torch.device):
         state = state["params"]
 
     if arch == "SRVGGNetCompact":
-        # Détection automatique de num_conv depuis le checkpoint
-        # Les clés du body sont : body.0.weight, body.2.weight, …
-        conv_indices = sorted(set(
-            int(k.split(".")[1]) for k in state
-            if k.startswith("body.") and k.split(".")[1].isdigit()
-            and "weight" in k
-        ))
-        # Chaque couche Conv2d est à un index pair (0, 2, 4, …)
-        # Nombre de Conv dans le corps = len(conv_indices) - 1 (on soustrait la conv finale)
+        # ── Détection robuste depuis le checkpoint ──────────────────────────
+        # Structure body (pairs = Conv2d, impairs = PReLU) :
+        #   body.0            : Conv(in_ch -> num_feat)
+        #   body.1            : PReLU
+        #   body.2 .. 2+2n-1  : num_conv x [Conv(feat->feat) + PReLU]
+        #   body.2+2*num_conv : Conv(feat -> out_ch*scale^2)   <- dernière Conv
+        #   body.2+2*num_conv+1 : PixelShuffle
+        #
+        # La formule exacte: last_conv_index = 2 + 2*num_conv
+        #                =>  num_conv = (last_conv_index - 2) // 2
+        #
+        conv_weight_keys = sorted(
+            [k for k in state if k.endswith(".weight") and state[k].dim() == 4],
+            key=lambda k: int(k.split(".")[1])
+        )
         num_feat = info.get("num_feat", 64)
         num_conv = info.get("num_conv", 32)
-
-        # Inférence depuis le checkpoint si possible
-        if conv_indices:
-            # Dernier index pair avant pixel-shuffle
-            num_conv_detected = (len(conv_indices) - 2)  # -1 première, -1 dernière
-            if num_conv_detected > 0:
-                num_conv = num_conv_detected
-            # num_feat depuis la shape de la 1re couche
-            first_conv_key = "body.0.weight"
-            if first_conv_key in state:
-                num_feat = state[first_conv_key].shape[0]
-
+        if conv_weight_keys:
+            num_feat = state[conv_weight_keys[0]].shape[0]          # out of body.0
+            last_idx = int(conv_weight_keys[-1].split(".")[1])     # e.g. 66
+            num_conv = (last_idx - 2) // 2                          # e.g. (66-2)//2 = 32
+        print(f"[SmartUpscaler] Arch: SRVGGNetCompact | num_feat={num_feat} | num_conv={num_conv}")
         net = SRVGGNetCompact(
             num_in_ch=3, num_out_ch=3,
             num_feat=num_feat, num_conv=num_conv,
             upscale=scale, act_type="prelu"
         )
-        print(f"[SmartUpscaler] Arch: SRVGGNetCompact | num_feat={num_feat} | num_conv={num_conv}")
 
     else:
         # Architecture RRDB — comptage dynamique des blocs
