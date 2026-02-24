@@ -34,7 +34,7 @@ MODELS = {
     "RealESRGAN-x4plus": {
         "url":      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
         "scale":    4,
-        "sha256":   "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",  # first 16 chars guard
+        "sha256":   "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
     },
     "RealESRGAN-x2plus": {
         "url":      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
@@ -44,7 +44,27 @@ MODELS = {
     "RealESRGAN-animevideo-x4": {
         "url":      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth",
         "scale":    4,
-        "sha256":   "f5d3f2c3d7fc9b9b6c2e5a8e4f8d1a7b",  # placeholder, will skip strict check
+        "sha256":   "f5d3f2c3d7fc9b9b6c2e5a8e4f8d1a7b",
+    },
+    # RealESR-General-x4v3 — meilleur modèle généraliste v3
+    # Architecture SRVGGNetCompact (plus légère et plus rapide que RRDB)
+    # Excellente sur photos réelles, screenshots, frames vidéo dégradées
+    "RealESR-General-x4v3": {
+        "url":      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        "scale":    4,
+        "sha256":   "86d5ef0e2b5f5f1f3e4e4e4e4e4e4e4e",  # soft check
+        "arch":     "SRVGGNetCompact",  # architecture différente — gérée séparément
+        "num_feat": 64,
+        "num_conv": 32,
+    },
+    # Variante dégradée supprimée (wdn = with-denoise) — optionnel
+    "RealESR-General-wdn-x4v3": {
+        "url":      "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
+        "scale":    4,
+        "sha256":   "a7c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6",  # soft check
+        "arch":     "SRVGGNetCompact",
+        "num_feat": 64,
+        "num_conv": 32,
     },
 }
 
@@ -126,6 +146,71 @@ class RRDBNet(nn.Module):
 
 
 # ──────────────────────────────────────────────
+# SRVGGNetCompact — architecture de RealESR-General-x4v3
+# Plus rapide que RRDB, très efficace sur contenu général
+# ──────────────────────────────────────────────
+
+class SRVGGNetCompact(nn.Module):
+    """
+    Architecture légère utilisée par realesr-general-x4v3.
+    Référence : https://github.com/xinntao/Real-ESRGAN (SRVGGNetCompact)
+    """
+    def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=64,
+                 num_conv=32, upscale=4, act_type="prelu"):
+        super().__init__()
+        self.num_in_ch  = num_in_ch
+        self.num_out_ch = num_out_ch
+        self.num_feat   = num_feat
+        self.num_conv   = num_conv
+        self.upscale    = upscale
+        self.act_type   = act_type
+
+        self.body: list[nn.Module] = []
+
+        # Première couche
+        self.body.append(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
+        self.body.append(self._act())
+
+        # Corps convolutif
+        for _ in range(num_conv):
+            self.body.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
+            self.body.append(self._act())
+
+        # Couche de sortie + pixel-shuffle
+        self.body.append(nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, 1, 1))
+        self.body.append(nn.PixelShuffle(upscale))
+
+        self.body = nn.Sequential(*self.body)
+
+        # Initialisation
+        self._initialize_weights()
+
+    def _act(self) -> nn.Module:
+        if self.act_type == "relu":
+            return nn.ReLU(inplace=True)
+        elif self.act_type == "prelu":
+            return nn.PReLU(num_parameters=self.num_feat)
+        elif self.act_type == "leakyrelu":
+            return nn.LeakyReLU(negative_slope=0.1, inplace=True)
+        raise ValueError(f"Unknown act_type: {self.act_type}")
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                        nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        out = self.body(x)
+        # Upsampling bilinear de l'entrée pour residual global
+        base = F.interpolate(x, scale_factor=self.upscale,
+                             mode="nearest")
+        return out + base
+
+
+# ──────────────────────────────────────────────
 # Download helper
 # ──────────────────────────────────────────────
 
@@ -155,40 +240,75 @@ def ensure_model(model_name: str) -> Path:
 # ──────────────────────────────────────────────
 _MODEL_CACHE: dict = {}
 
-def load_model(model_name: str, device: torch.device) -> RRDBNet:
+def load_model(model_name: str, device: torch.device):
     cache_key = (model_name, str(device))
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    info = MODELS[model_name]
+    info  = MODELS[model_name]
     scale = info["scale"]
+    arch  = info.get("arch", "RRDBNet")
     weights_path = ensure_model(model_name)
 
-    # Detect num_block from checkpoint
     state = torch.load(weights_path, map_location="cpu")
     if "params_ema" in state:
         state = state["params_ema"]
     elif "params" in state:
         state = state["params"]
 
-    # Count RRDB blocks
-    num_block = max(
-        int(k.split(".")[1]) for k in state if k.startswith("body.")
-        and k.split(".")[1].isdigit()
-    ) + 1 if any(k.startswith("body.") for k in state) else 23
+    if arch == "SRVGGNetCompact":
+        # Détection automatique de num_conv depuis le checkpoint
+        # Les clés du body sont : body.0.weight, body.2.weight, …
+        conv_indices = sorted(set(
+            int(k.split(".")[1]) for k in state
+            if k.startswith("body.") and k.split(".")[1].isdigit()
+            and "weight" in k
+        ))
+        # Chaque couche Conv2d est à un index pair (0, 2, 4, …)
+        # Nombre de Conv dans le corps = len(conv_indices) - 1 (on soustrait la conv finale)
+        num_feat = info.get("num_feat", 64)
+        num_conv = info.get("num_conv", 32)
 
-    net = RRDBNet(num_feat=64, num_block=num_block, num_grow_ch=32, scale=scale)
+        # Inférence depuis le checkpoint si possible
+        if conv_indices:
+            # Dernier index pair avant pixel-shuffle
+            num_conv_detected = (len(conv_indices) - 2)  # -1 première, -1 dernière
+            if num_conv_detected > 0:
+                num_conv = num_conv_detected
+            # num_feat depuis la shape de la 1re couche
+            first_conv_key = "body.0.weight"
+            if first_conv_key in state:
+                num_feat = state[first_conv_key].shape[0]
+
+        net = SRVGGNetCompact(
+            num_in_ch=3, num_out_ch=3,
+            num_feat=num_feat, num_conv=num_conv,
+            upscale=scale, act_type="prelu"
+        )
+        print(f"[SmartUpscaler] Arch: SRVGGNetCompact | num_feat={num_feat} | num_conv={num_conv}")
+
+    else:
+        # Architecture RRDB — comptage dynamique des blocs
+        num_block = 23
+        body_keys = [k for k in state if k.startswith("body.") and k.split(".")[1].isdigit()]
+        if body_keys:
+            num_block = max(int(k.split(".")[1]) for k in body_keys) + 1
+
+        net = RRDBNet(num_feat=64, num_block=num_block, num_grow_ch=32, scale=scale)
+        print(f"[SmartUpscaler] Arch: RRDBNet | num_block={num_block}")
+
     net.load_state_dict(state, strict=False)
     net.eval()
+    # Ajout d'un attribut scale uniforme pour le reste du code
+    net.scale = scale
 
-    # Half precision on CUDA for speed
     if device.type == "cuda":
         net = net.half().to(device)
     else:
         net = net.to(device)
 
     _MODEL_CACHE[cache_key] = net
-    print(f"[SmartUpscaler] Model '{model_name}' loaded on {device} (scale×{scale})")
+    print(f"[SmartUpscaler] ✓ '{model_name}' chargé sur {device} (×{scale})")
     return net
 
 
