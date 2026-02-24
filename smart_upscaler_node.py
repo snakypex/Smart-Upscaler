@@ -110,20 +110,27 @@ class RRDB(nn.Module):
 
 
 class RRDBNet(nn.Module):
-    """Generalized RRDB network matching official checkpoints."""
+    """Generalized RRDB network matching official checkpoints.
+    Supporte le pixel-unshuffle en entrée (ex: RealESRGAN-x2plus avec num_in_ch=12).
+    """
     def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=64,
                  num_block=23, num_grow_ch=32, scale=4):
         super().__init__()
         self.scale = scale
+        # pixel-unshuffle factor : num_in_ch = 3 * unshuffle_factor²
+        # ex: num_in_ch=12 → unshuffle=2 ; num_in_ch=3 → unshuffle=1 (pas de unshuffle)
+        self.unshuffle_factor = round((num_in_ch / 3) ** 0.5)
         self.conv_first = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
         self.body = nn.Sequential(*[RRDB(num_feat, num_grow_ch) for _ in range(num_block)])
         self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
 
-        # Upsampling
+        # Upsampling (le scale réseau = scale_total / unshuffle_factor)
+        net_scale = scale // self.unshuffle_factor if self.unshuffle_factor > 1 else scale
+        self.net_scale = net_scale
         self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-        if scale >= 4:
+        if net_scale >= 4:
             self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-        if scale == 8:
+        if net_scale == 8:
             self.conv_up3 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
 
         self.conv_hr   = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
@@ -131,14 +138,17 @@ class RRDBNet(nn.Module):
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
     def forward(self, x):
+        # Pixel-unshuffle si nécessaire (augmente les canaux, réduit la résolution)
+        if self.unshuffle_factor > 1:
+            x = F.pixel_unshuffle(x, self.unshuffle_factor)
         feat = self.conv_first(x)
         body_feat = self.conv_body(self.body(feat))
         feat = feat + body_feat
 
         feat = self.lrelu(self.conv_up1(F.interpolate(feat, scale_factor=2, mode='nearest')))
-        if self.scale >= 4:
+        if self.net_scale >= 4:
             feat = self.lrelu(self.conv_up2(F.interpolate(feat, scale_factor=2, mode='nearest')))
-        if self.scale == 8:
+        if self.net_scale == 8:
             feat = self.lrelu(self.conv_up3(F.interpolate(feat, scale_factor=2, mode='nearest')))
 
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
@@ -286,14 +296,20 @@ def load_model(model_name: str, device: torch.device):
         )
 
     else:
-        # Architecture RRDB — comptage dynamique des blocs
+        # Architecture RRDB — détection dynamique depuis le checkpoint
         num_block = 23
         body_keys = [k for k in state if k.startswith("body.") and k.split(".")[1].isdigit()]
         if body_keys:
             num_block = max(int(k.split(".")[1]) for k in body_keys) + 1
 
-        net = RRDBNet(num_feat=64, num_block=num_block, num_grow_ch=32, scale=scale)
-        print(f"[SmartUpscaler] Arch: RRDBNet | num_block={num_block}")
+        # num_in_ch : détecté depuis conv_first.weight (shape [out, in, kH, kW])
+        # RealESRGAN-x2plus utilise pixel-unshuffle x2 → num_in_ch = 3*4 = 12
+        num_in_ch = 3
+        if "conv_first.weight" in state:
+            num_in_ch = state["conv_first.weight"].shape[1]
+
+        net = RRDBNet(num_in_ch=num_in_ch, num_feat=64, num_block=num_block, num_grow_ch=32, scale=scale)
+        print(f"[SmartUpscaler] Arch: RRDBNet | num_block={num_block} | num_in_ch={num_in_ch}")
 
     net.load_state_dict(state, strict=False)
     net.eval()
