@@ -224,17 +224,47 @@ class SRVGGNetCompact(nn.Module):
 # Download helper
 # ──────────────────────────────────────────────
 
+def _fmt_mb(b: int) -> str:
+    if b >= 1024**3: return f"{b/1024**3:.1f} GB"
+    if b >= 1024**2: return f"{b/1024**2:.1f} MB"
+    return f"{b/1024:.1f} KB"
+
+def _ram_used_mb() -> float:
+    """RAM process (RSS) en MB via /proc/self/status (Linux)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+def _log(msg: str) -> None:
+    print(f"[SmartUpscaler] {msg}", flush=True)
+
 def download_model(url: str, dest: Path) -> None:
+    import time
     dest.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[SmartUpscaler] Downloading model → {dest}")
+    _log(f"⬇  Téléchargement → {dest.name}")
     resp = requests.get(url, stream=True, timeout=120)
     resp.raise_for_status()
     total = int(resp.headers.get("content-length", 0))
-    with open(dest, "wb") as f, tqdm(total=total, unit="B", unit_scale=True) as bar:
-        for chunk in resp.iter_content(chunk_size=8192):
+    downloaded = 0
+    t0 = time.time()
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
             f.write(chunk)
-            bar.update(len(chunk))
-    print(f"[SmartUpscaler] Download complete: {dest}")
+            downloaded += len(chunk)
+            if total:
+                pct  = downloaded / total * 100
+                spd  = downloaded / max(time.time() - t0, 0.001)
+                eta  = (total - downloaded) / max(spd, 1)
+                print(f"\r[SmartUpscaler]    {pct:5.1f}%  {_fmt_mb(downloaded)}/{_fmt_mb(total)}"
+                      f"  vitesse: {_fmt_mb(int(spd))}/s  ETA: {eta:.0f}s   ", end="", flush=True)
+    print()  # newline après la barre
+    elapsed = time.time() - t0
+    _log(f"✓ Téléchargement terminé: {dest.name} ({_fmt_mb(dest.stat().st_size)}, {elapsed:.1f}s)")
 
 
 def ensure_model(model_name: str) -> Path:
@@ -313,16 +343,24 @@ def load_model(model_name: str, device: torch.device):
 
     net.load_state_dict(state, strict=False)
     net.eval()
-    # Ajout d'un attribut scale uniforme pour le reste du code
     net.scale = scale
 
+    ram_before = _ram_used_mb()
     if device.type == "cuda":
+        vram_before = torch.cuda.memory_allocated() // 1024 // 1024
         net = net.half().to(device)
+        vram_after  = torch.cuda.memory_allocated() // 1024 // 1024
+        vram_model  = vram_after - vram_before
+        _log(f"✓ '{model_name}' chargé sur {device} (×{scale}) | "
+             f"VRAM modèle: +{vram_model} MB (total alloué: {vram_after} MB) | "
+             f"RAM process: {_ram_used_mb():.0f} MB")
     else:
         net = net.to(device)
+        ram_after = _ram_used_mb()
+        _log(f"✓ '{model_name}' chargé sur CPU (×{scale}) | "
+             f"RAM modèle: +{ram_after - ram_before:.0f} MB (total: {ram_after:.0f} MB)")
 
     _MODEL_CACHE[cache_key] = net
-    print(f"[SmartUpscaler] ✓ '{model_name}' chargé sur {device} (×{scale})")
     return net
 
 
@@ -330,28 +368,43 @@ def load_model(model_name: str, device: torch.device):
 # Tile-based inference (avoids OOM on large frames)
 # ──────────────────────────────────────────────
 
-def upscale_tile(model: RRDBNet, img_tensor: torch.Tensor,
-                 tile: int = 512, overlap: int = 32) -> torch.Tensor:
-    """Process image in tiles to handle large resolutions without OOM."""
+def upscale_tile(model, img_tensor: torch.Tensor,
+                 tile: int = 512, overlap: int = 32,
+                 frame_label: str = "") -> torch.Tensor:
+    """Process image in tiles — output on CPU, flush CUDA cache per tile."""
+    import time
     device = next(model.parameters()).device
+    dtype  = next(model.parameters()).dtype
     scale  = model.scale
     _, c, h, w = img_tensor.shape
 
+    step     = max(tile - overlap, 1)
+    n_cols   = len(range(0, w, step))
+    n_rows   = len(range(0, h, step))
+    n_tiles  = n_cols * n_rows
+    tile_idx = 0
+    t_pass   = time.time()
+
     output_h = h * scale
     output_w = w * scale
-    output   = torch.zeros((1, c, output_h, output_w),
-                            dtype=img_tensor.dtype, device=device)
+    output   = torch.zeros((1, c, output_h, output_w), dtype=torch.float32)
 
-    for y in range(0, h, tile - overlap):
-        for x in range(0, w, tile - overlap):
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            t_tile = time.time()
+            tile_idx += 1
             y_end = min(y + tile, h)
             x_end = min(x + tile, w)
-            patch = img_tensor[:, :, y:y_end, x:x_end].to(device)
+
+            patch = img_tensor[:, :, y:y_end, x:x_end].to(device=device, dtype=dtype)
 
             with torch.no_grad():
-                out_patch = model(patch)
+                out_patch = model(patch).float().cpu()
 
-            # Paste without border pixels to hide seams
+            del patch
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             oy = y * scale
             ox = x * scale
             border_y = overlap * scale // 2 if y > 0 else 0
@@ -361,13 +414,30 @@ def upscale_tile(model: RRDBNet, img_tensor: torch.Tensor,
                    oy + border_y : oy + out_patch.shape[2],
                    ox + border_x : ox + out_patch.shape[3]] = \
                 out_patch[:, :, border_y:, border_x:]
+            del out_patch
 
-    return output
+            # Log toutes les N tuiles pour ne pas spammer
+            log_every = max(1, n_tiles // 8)
+            if tile_idx == 1 or tile_idx % log_every == 0 or tile_idx == n_tiles:
+                elapsed   = time.time() - t_pass
+                remaining = elapsed / tile_idx * (n_tiles - tile_idx)
+                vram_str  = ""
+                if device.type == "cuda":
+                    used  = (torch.cuda.memory_allocated() ) // 1024 // 1024
+                    total = torch.cuda.mem_get_info()[1] // 1024 // 1024
+                    vram_str = f"  VRAM: {used} MB alloc / {total} MB total"
+                ram_str = f"  RAM: {_ram_used_mb():.0f} MB"
+                prefix  = f"{frame_label} " if frame_label else ""
+                print(f"[SmartUpscaler]    {prefix}tuile {tile_idx:3d}/{n_tiles}"
+                      f"  ({x_end-y_end+tile}x{tile}px→×{scale})"
+                      f"  ETA: {remaining:.0f}s{vram_str}{ram_str}", flush=True)
 
+    elapsed_pass = time.time() - t_pass
+    _log(f"   {frame_label + ' ' if frame_label else ''}pass terminé: {n_tiles} tuiles"
+         f"  {w}x{h} → {output_w}x{output_h}"
+         f"  durée: {elapsed_pass:.1f}s  ({elapsed_pass/n_tiles*1000:.0f} ms/tuile)")
+    return output  # float32 CPU
 
-# ──────────────────────────────────────────────
-# Aspect-ratio-aware resize to target long-edge
-# ──────────────────────────────────────────────
 
 def resize_to_target(img: torch.Tensor, target_long_edge: int) -> torch.Tensor:
     """Resize tensor (B,C,H,W) keeping aspect ratio, targeting the long edge."""
@@ -428,58 +498,146 @@ class SmartUpscalerNode:
                 model_name: str, tile_size: int, tile_overlap: int,
                 force_exact_resolution: bool = False):
 
+        import gc, time
+        t_total = time.time()
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cpu":
-            print("[SmartUpscaler] ⚠ CUDA not available — falling back to CPU (slow!)")
+
+        # ── En-tête ─────────────────────────────────────────────────────────
+        sep = "─" * 60
+        _log(sep)
+        _log(f"🔍 Smart Upscaler  |  modèle: {model_name}  |  cible: {target_resolution}")
+        _log(f"   device: {device}  |  tile: {tile_size}px  |  overlap: {tile_overlap}px")
+        if device.type == "cuda":
+            free_mb  = torch.cuda.mem_get_info()[0] // 1024 // 1024
+            total_mb = torch.cuda.mem_get_info()[1] // 1024 // 1024
+            _log(f"   VRAM dispo: {free_mb} MB / {total_mb} MB  |  RAM process: {_ram_used_mb():.0f} MB")
+        else:
+            _log(f"   ⚠ CUDA non disponible — CPU (lent!)")
+            _log(f"   RAM process: {_ram_used_mb():.0f} MB")
+        _log(sep)
 
         target_px = RESOLUTIONS[target_resolution]
         model     = load_model(model_name, device)
-        model_scale = model.scale
 
-        # ComfyUI images: (B, H, W, C) float32
-        # Convert to (B, C, H, W) for PyTorch
-        x = image.permute(0, 3, 1, 2)  # B,C,H,W
-        if device.type == "cuda":
-            x = x.half()
+        nb_frames, h_in, w_in, c_in = image.shape
+        _log(f"   Batch: {nb_frames} frame(s)  |  entrée: {w_in}×{h_in}  |  canaux: {c_in}")
 
-        results = []
-        for i in range(x.shape[0]):
-            frame = x[i:i+1]  # 1,C,H,W
-            _, _, h, w = frame.shape
+        # ── Calcul taille de sortie ──────────────────────────────────────────
+        long_edge = max(h_in, w_in)
+        if long_edge >= target_px:
+            out_h = int(round(h_in * target_px / long_edge))
+            out_w = int(round(w_in * target_px / long_edge))
+            n_passes = 0
+        else:
+            sim_h, sim_w = h_in, w_in
+            n_passes = 0
+            while max(sim_h, sim_w) < target_px:
+                sim_h  *= model.scale
+                sim_w  *= model.scale
+                n_passes += 1
+            scale_f = target_px / max(sim_h, sim_w)
+            out_h = int(round(sim_h * scale_f))
+            out_w = int(round(sim_w * scale_f))
+        out_h += out_h % 2
+        out_w += out_w % 2
 
-            # ── Determine how many upscale passes needed ──
-            long_edge = max(h, w)
+        # Estimation tuiles par frame par passe
+        step = max(tile_size - tile_overlap, 1)
+        tiles_per_pass = (
+            len(range(0, w_in * (model.scale ** max(n_passes-1,0)), step)) *
+            len(range(0, h_in * (model.scale ** max(n_passes-1,0)), step))
+        ) if n_passes else 0
 
-            # If already bigger than target, just resize down
-            if long_edge >= target_px:
+        ram_output_mb = nb_frames * out_h * out_w * c_in * 4 // 1024 // 1024
+        _log(f"   Sortie: {out_w}×{out_h}  |  passes/frame: {n_passes}  |"
+             f"  RAM output batch: ~{ram_output_mb} MB")
+        _log(sep)
+
+        # ── Pré-allocation du tenseur de sortie ──────────────────────────────
+        output_batch = torch.empty((nb_frames, out_h, out_w, c_in),
+                                   dtype=torch.float32, pin_memory=False)
+        _log(f"   Tenseur sortie pré-alloué: {output_batch.numel()*4//1024//1024} MB RAM")
+
+        for i in range(nb_frames):
+            t_frame = time.time()
+            frame_label = f"[{i+1}/{nb_frames}]"
+            _log(f"")
+            _log(f"▶ Frame {i+1}/{nb_frames}  |  RAM: {_ram_used_mb():.0f} MB"
+                 + (f"  VRAM allouée: {torch.cuda.memory_allocated()//1024//1024} MB"
+                    if device.type == "cuda" else ""))
+
+            frame = image[i].permute(2, 0, 1).unsqueeze(0).float()  # 1,C,H,W CPU
+            long_edge_f = max(frame.shape[2], frame.shape[3])
+
+            if long_edge_f >= target_px:
+                _log(f"   Déjà ≥ cible — redimensionnement direct (pas d'upscale IA)")
                 out = resize_to_target(frame, target_px)
             else:
-                # Upscale with model (may need multiple passes)
-                current = frame
+                current  = frame
+                pass_num = 0
                 while max(current.shape[2], current.shape[3]) < target_px:
-                    current = upscale_tile(model, current, tile_size, tile_overlap)
+                    pass_num += 1
+                    cur_w, cur_h = current.shape[3], current.shape[2]
+                    _log(f"   Pass {pass_num}/{n_passes}  |  entrée: {cur_w}×{cur_h}"
+                         f"  →  sortie estimée: {cur_w*model.scale}×{cur_h*model.scale}"
+                         + (f"  |  VRAM libre: {torch.cuda.mem_get_info()[0]//1024//1024} MB"
+                            f"  allouée: {torch.cuda.memory_allocated()//1024//1024} MB"
+                            if device.type == "cuda" else "")
+                         + f"  |  RAM: {_ram_used_mb():.0f} MB")
+                    t_pass = time.time()
+                    prev    = current
+                    current = upscale_tile(model, current, tile_size, tile_overlap,
+                                           frame_label=f"{frame_label} pass {pass_num}")
                     current = current.clamp(0, 1)
+                    del prev
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    _log(f"   Pass {pass_num} terminée en {time.time()-t_pass:.1f}s"
+                         + (f"  |  VRAM libre: {torch.cuda.mem_get_info()[0]//1024//1024} MB"
+                            if device.type == "cuda" else ""))
 
-                # Final resize to exact target long-edge
                 out = resize_to_target(current, target_px)
+                del current
 
             if force_exact_resolution:
-                # Center-crop to exact square of target_px (useful for some pipelines)
                 _, c, oh, ow = out.shape
                 cy, cx = oh // 2, ow // 2
-                half = target_px // 2
-                out = out[:, :,
-                          max(0, cy-half):cy+half,
-                          max(0, cx-half):cx+half]
+                half   = target_px // 2
+                out = out[:, :, max(0,cy-half):cy+half, max(0,cx-half):cx+half]
 
-            results.append(out.float().cpu())
+            h_out = min(out.shape[2], out_h)
+            w_out = min(out.shape[3], out_w)
+            output_batch[i, :h_out, :w_out, :] = out[0, :, :h_out, :w_out].permute(1, 2, 0)
+            del out, frame
 
-        # Stack & convert back to (B, H, W, C)
-        stacked = torch.cat(results, dim=0).permute(0, 2, 3, 1)
-        stacked = stacked.clamp(0, 1)
+            t_frame_elapsed = time.time() - t_frame
+            fps_est = 1.0 / max(t_frame_elapsed, 0.001)
+            frames_left = nb_frames - (i + 1)
+            eta_total = t_frame_elapsed * frames_left
+            _log(f"◀ Frame {i+1}/{nb_frames} terminée  |  durée: {t_frame_elapsed:.1f}s"
+                 f"  ({fps_est:.2f} fps)  |  ETA: {eta_total:.0f}s"
+                 f"  |  RAM: {_ram_used_mb():.0f} MB"
+                 + (f"  VRAM allouée: {torch.cuda.memory_allocated()//1024//1024} MB"
+                    if device.type == "cuda" else ""))
 
-        print(f"[SmartUpscaler] ✓ {image.shape} → {stacked.shape} ({target_resolution})")
-        return (stacked,)
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        t_elapsed = time.time() - t_total
+        _log("")
+        _log(sep)
+        _log(f"✅ Terminé  |  {nb_frames} frame(s)  {w_in}×{h_in} → {out_w}×{out_h}"
+             f"  ({target_resolution})  |  durée totale: {t_elapsed:.1f}s"
+             f"  ({nb_frames/max(t_elapsed,0.001):.2f} fps)")
+        _log(f"   RAM finale: {_ram_used_mb():.0f} MB"
+             + (f"  |  VRAM allouée: {torch.cuda.memory_allocated()//1024//1024} MB"
+                f"  /  réservée: {torch.cuda.memory_reserved()//1024//1024} MB"
+                if device.type == "cuda" else ""))
+        _log(sep)
+
+        return (output_batch.clamp(0, 1),)
 
 
 # ──────────────────────────────────────────────
