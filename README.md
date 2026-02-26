@@ -1,89 +1,102 @@
-# 🔍 Smart Upscaler — ComfyUI Custom Node
+# 🎌 ComfyUI-AnimeUpscale4K
 
-Upscale des frames issues d'interpolation vers **1080p, 2K, 4K ou 8K** via RealESRGAN sous **CUDA**.  
-Gère tous les formats : paysage, portrait, carré, ultra-wide, etc.
+**Post-processing node pack for anime-style videos generated with Wan2.1/2.2.**
 
----
-
-## ✨ Fonctionnalités
-
-| Feature | Détail |
-|---|---|
-| **Résolutions cibles** | 1080p · 2K · 4K · 8K (bord long) |
-| **Formats supportés** | Horizontal, Vertical, Carré — ratio conservé automatiquement |
-| **CUDA** | Half-precision (fp16) pour vitesse maximale |
-| **Auto-download** | Le modèle se télécharge automatiquement au premier usage |
-| **Tiling** | Traitement par tuiles → pas d'OOM même sur les grandes frames |
-| **Multi-pass** | Plusieurs passes si le facteur d'agrandissement requis est > 4× |
-| **Batch** | Traite les batches de frames (sorties d'interpolation) |
+Upscale to 4K with Real-ESRGAN, fix flickering, enhance colors and line art — all with auto model download.
 
 ---
 
-## 📦 Installation
+## 📦 Nodes
 
+| Node | Description |
+|------|-------------|
+| **🎌 Anime Upscale 4K** | Real-ESRGAN upscaling (auto model download) → 4K/2K/1080p |
+| **🎨 Anime Color Correct** | Brightness, contrast, saturation, gamma, color temperature |
+| **✨ Anime Sharpen** | Unsharp mask optimized for anime (edge-only mode) |
+| **🔇 Anime Temporal Denoise** | Reduce Wan2.x flickering via adaptive temporal blend |
+| **✏️ Anime Line Enhance** | Reinforce line art in luminance (preserves flat colors) |
+| **🎬 Anime Export Video** | Export to MP4 via FFmpeg (H.265/H.264/AV1 + audio) |
+| **⚡ Wan2 Post-Process Pipeline** | All-in-one: denoise → color → upscale → lines → sharpen |
+
+---
+
+## 🚀 Installation
+
+### Via ComfyUI Manager (recommandé)
+Search for `AnimeUpscale4K` in ComfyUI Manager and click Install.
+
+### Manuel
 ```bash
-# 1. Copier dans le dossier custom_nodes de ComfyUI
-cp -r comfyui_smart_upscaler/ <ComfyUI>/custom_nodes/
-
-# 2. Installer les dépendances (si pas déjà présentes)
-pip install torch torchvision tqdm requests
+cd ComfyUI/custom_nodes
+git clone https://github.com/YOUR_USERNAME/ComfyUI-AnimeUpscale4K.git
+cd ComfyUI-AnimeUpscale4K
+pip install -r requirements.txt
 ```
 
-Relancer ComfyUI — le nœud apparaît dans la catégorie **image/upscaling**.
+### Prérequis
+- **Python** 3.10+
+- **PyTorch** 2.0+ avec CUDA
+- **FFmpeg** installé (pour le nœud Export Video)
+- **GPU** 6+ Go VRAM recommandé (réduire `tile_size` si nécessaire)
 
 ---
 
-## 🤖 Modèles disponibles
+## 🎯 Workflow recommandé pour Wan2.2
 
-| Modèle | Facteur | Usage recommandé | Téléchargement automatique |
-|---|---|---|---|
-| `RealESRGAN-x4plus` | ×4 | Vidéo réaliste, photos | ✅ |
-| `RealESRGAN-x2plus` | ×2 | Upscale modéré, qualité max | ✅ |
-| `RealESRGAN-animevideo-x4` | ×4 | Anime, cartoon, illustration | ✅ |
-
-Les fichiers `.pth` sont sauvegardés dans `models/upscale_models/`.
-
----
-
-## 🔌 Paramètres du nœud
-
-| Paramètre | Type | Défaut | Description |
-|---|---|---|---|
-| `image` | IMAGE | — | Entrée : frames interpolées (batch OK) |
-| `target_resolution` | Enum | `4K` | Résolution cible (bord long en pixels) |
-| `model_name` | Enum | `RealESRGAN-x4plus` | Modèle d'upscaling |
-| `tile_size` | INT | `512` | Taille des tuiles CUDA (baisser si OOM) |
-| `tile_overlap` | INT | `32` | Chevauchement des tuiles (cache les jointures) |
-| `force_exact_resolution` | BOOL | `False` | Force crop carré exact (rare) |
-
----
-
-## 🔄 Exemple de workflow
-
+### Simple (All-in-One)
 ```
-[Video Loader] → [Frame Interpolation] → [SmartUpscaler 4K] → [Video Combine]
+[Wan2.2 Generate] → [⚡ Wan2 Post-Process Pipeline] → [🎬 Export Video]
 ```
 
-Ou en batch :
+### Avancé (contrôle total)
 ```
-[Image Batch] → [SmartUpscaler 2K] → [Preview / Save]
+[Wan2.2 Generate]
+    ↓
+[🔇 Temporal Denoise]    ← Réduit le flickering
+    ↓
+[🎨 Color Correct]       ← Ajuste saturation, contraste
+    ↓
+[🎌 Anime Upscale 4K]    ← Upscale Real-ESRGAN → 4K
+    ↓
+[✏️ Line Enhance]        ← Renforce les lignes
+    ↓
+[✨ Anime Sharpen]        ← Sharpen final
+    ↓
+[🎬 Export Video]         ← MP4 H.265
 ```
 
 ---
 
-## ⚡ Performances indicatives (RTX 3090, fp16)
+## ⚙️ Paramètres recommandés par résolution source
 
-| Frame source | Cible | Temps/frame |
-|---|---|---|
-| 540p → 4K | ×8 (2 passes) | ~1.2s |
-| 1080p → 4K | ×2 + resize | ~0.4s |
-| 720p → 8K | ×12 (3 passes) | ~3.5s |
+| Source Wan2.2 | Upscale Target | Tile Size | Qualité |
+|---------------|----------------|-----------|---------|
+| 480×320 | 4K | 256 | Bon |
+| 720×480 | 4K | 256 | Très bon |
+| 1280×720 | 4K | 256-512 | Excellent |
+| 1920×1080 | 2K ou 4K | 512 | Parfait |
 
 ---
 
-## 🛠 Dépannage
+## 💡 Tips
 
-**CUDA OOM** → Réduire `tile_size` (ex: 256)  
-**Frames floues** → Augmenter `tile_overlap` (ex: 64)  
-**Téléchargement bloqué** → Télécharger manuellement le `.pth` dans `models/upscale_models/`  
-**CPU lent** → Installer CUDA + PyTorch GPU : `pip install torch --index-url https://download.pytorch.org/whl/cu121`
+- **VRAM insuffisante ?** Réduisez `tile_size` à 128 ou 64.
+- **Flickering ?** Augmentez `temporal_denoise` (0.3-0.5), mais attention au ghosting.
+- **Couleurs ternes ?** Montez `saturation` à 1.1-1.2 et `contrast` à 1.05-1.1.
+- **Lignes floues ?** Utilisez `Line Enhance` (0.3-0.5) + `Sharpen edge_only` (0.3-0.5).
+- **Export léger ?** Utilisez AV1 avec CRF 24-28 pour une taille réduite.
+
+---
+
+## 📋 Models (auto-downloaded)
+
+Les modèles sont téléchargés automatiquement dans `ComfyUI/models/anime_upscale/` :
+
+- `realesr-animevideov3.pth` (~16 Mo) — Optimisé vidéo anime
+- `RealESRGAN_x4plus_anime_6B.pth` (~16 Mo) — Haute qualité image anime
+
+---
+
+## 📄 License
+
+MIT License
