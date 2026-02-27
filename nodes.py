@@ -388,13 +388,23 @@ class AnimeUpscale4K:
             if target is not None:
                 h, w = output.shape[:2]
                 src_aspect = w / h
-                tgt_aspect = target[0] / target[1]
-                if src_aspect >= tgt_aspect:
-                    final_w = target[0]
-                    final_h = int(round(target[0] / src_aspect / 2) * 2)
+
+                # Detect orientation: swap target for portrait/vertical videos
+                if src_aspect < 1.0:
+                    # Portrait: target becomes (2160, 3840) instead of (3840, 2160)
+                    tgt_w, tgt_h = target[1], target[0]
                 else:
-                    final_h = target[1]
-                    final_w = int(round(target[1] * src_aspect / 2) * 2)
+                    # Landscape or square
+                    tgt_w, tgt_h = target[0], target[1]
+
+                # Fit inside target while preserving aspect ratio
+                scale_w = tgt_w / w
+                scale_h = tgt_h / h
+                fit_scale = min(scale_w, scale_h)
+
+                final_w = int(round(w * fit_scale / 2) * 2)  # ensure even
+                final_h = int(round(h * fit_scale / 2) * 2)
+
                 if (w, h) != (final_w, final_h):
                     interp = cv2.INTER_AREA if w > final_w else cv2.INTER_LANCZOS4
                     output = cv2.resize(output, (final_w, final_h), interpolation=interp)
